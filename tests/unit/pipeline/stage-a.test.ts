@@ -1,11 +1,18 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { DetectionRecord, Shot } from '@/lib/domain/analysis';
 import type { ColourSignature } from '@/lib/domain/backing';
 import type { TemplateId } from '@/lib/domain/enums';
 import type { Calibration } from '@/lib/domain/photo';
 import { defaultAppSettings } from '@/lib/domain/settings';
-import { NotATargetPhotoError, runStageA, priorInWorkingPx, shotTemplate, type CvApi } from '@/lib/pipeline/stage-a';
+import {
+  NotATargetPhotoError,
+  runStageA,
+  priorInWorkingPx,
+  shotTemplate,
+  withCvTimeout,
+  type CvApi,
+} from '@/lib/pipeline/stage-a';
 import type { ServiceContext } from '@/lib/services/context';
 import { getAnalysisRecord, putAnalysisRecord } from '@/lib/store/analyses-repo';
 import { photoWorkingKey } from '@/lib/store/blob-keys';
@@ -561,5 +568,33 @@ describe('shotTemplate (M23 step 4: the user\'s choice wins)', () => {
     expect(shotTemplate(photoWith(null, null), confidentPrecision, sightingDisc)).toBe('precision');
     expect(shotTemplate(photoWith(null, null), null, sightingDisc)).toBe('sighting');
     expect(shotTemplate(photoWith(null, null), null, precisionDisc)).toBe('precision');
+  });
+});
+
+describe('withCvTimeout (owner report, 2026-09-26: a CV call can hang indefinitely on-device)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('resolves with the call\'s own result when it settles before the timeout', async () => {
+    const result = withCvTimeout(Promise.resolve('done'), 'reviewAndAlign', 1000);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(await result).toBe('done');
+  });
+
+  it('rejects a hung call once the timeout elapses, instead of waiting forever', async () => {
+    const never = new Promise<string>(() => {});
+    const result = withCvTimeout(never, 'reviewAndAlign', 1000);
+    const assertion = expect(result).rejects.toThrow(/reviewAndAlign did not respond within 1s/);
+    await vi.advanceTimersByTimeAsync(1000);
+    await assertion;
+  });
+
+  it('propagates a normal rejection unchanged, without waiting for the timeout', async () => {
+    const result = withCvTimeout(Promise.reject(new Error('boom')), 'detectShots', 1000);
+    await expect(result).rejects.toThrow('boom');
   });
 });

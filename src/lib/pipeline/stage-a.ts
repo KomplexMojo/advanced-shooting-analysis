@@ -26,13 +26,41 @@ import { photoWorkingKey } from '@/lib/store/blob-keys';
 import { getBlob } from '@/lib/store/blobs-repo';
 import { getPhotoRecord, putPhotoRecord } from '@/lib/store/photos-repo';
 import { getSettings } from '@/lib/store/settings-repo';
-import type { CvWorkerApi, ReviewAndAlignResult } from '@/workers/cv-client';
+import { terminateCvClient, type CvWorkerApi, type ReviewAndAlignResult } from '@/workers/cv-client';
 
 import { chooseAlignment } from './alignment';
 import { shouldRerunStageA } from './template-change';
 
 /** Only the part of the worker Stage A needs, so tests can stub it. */
 export type CvApi = Pick<CvWorkerApi, 'reviewAndAlign' | 'detectShots'>;
+
+/** Owner report, 2026-09-26: a CV call has been observed to hang on-device rather than ever settling. */
+export const CV_CALL_TIMEOUT_MS = 45_000;
+
+/**
+ * Races a CV worker call against a timeout. On timeout, kills the persistent worker (`cv-client.ts`) so
+ * the *next* job gets a fresh one instead of queuing behind a wedged one forever, and rejects — which
+ * `runStageA`'s existing catch records as `stageA: 'error'` (retryable), rather than an indefinite
+ * "Reviewing…" spinner that previously needed the app force-quit and relaunched to clear.
+ */
+export function withCvTimeout<T>(promise: Promise<T>, label: string, timeoutMs = CV_CALL_TIMEOUT_MS): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      terminateCvClient();
+      reject(new Error(`${label} did not respond within ${Math.round(timeoutMs / 1000)}s; the CV worker was restarted`));
+    }, timeoutMs);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err: unknown) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
+}
 
 /** backing-sheet.md §3: a backing-card photo is not a target, so Stage A never runs on it. */
 export class NotATargetPhotoError extends Error {
@@ -155,7 +183,7 @@ export async function runStageA(
     // an import with a template set was still aligned by guess.
     const usedTemplate = photo.categorization.template ?? photo.capture?.overlayTemplate ?? null;
 
-    const review = await cvApi.reviewAndAlign(Comlink.transfer(bytes, [bytes]), prior, usedTemplate);
+    const review = await withCvTimeout(cvApi.reviewAndAlign(Comlink.transfer(bytes, [bytes]), prior, usedTemplate), 'reviewAndAlign');
 
     const choice =
       manualCalibration !== null
@@ -178,12 +206,15 @@ export async function runStageA(
     const detected =
       choice.calibration === null || hasManualShot
         ? null
-        : await cvApi.detectShots(
-            Comlink.transfer(bytesForShots, [bytesForShots]),
-            choice.calibration,
-            shotTemplate(photo, review.templateHint, choice.calibration),
-            settings.profileOverrides.holeDiameterMm,
-            backing,
+        : await withCvTimeout(
+            cvApi.detectShots(
+              Comlink.transfer(bytesForShots, [bytesForShots]),
+              choice.calibration,
+              shotTemplate(photo, review.templateHint, choice.calibration),
+              settings.profileOverrides.holeDiameterMm,
+              backing,
+            ),
+            'detectShots',
           );
 
     // backing-sheet.md §3, §5.6: record which path ran, and warn when the colour path found nothing.

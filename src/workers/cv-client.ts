@@ -66,10 +66,25 @@ export interface CvWorkerApi {
 }
 
 let client: Comlink.Remote<CvWorkerApi> | undefined;
+let rawWorker: Worker | undefined;
 
 export function getCvClient(): Comlink.Remote<CvWorkerApi> {
-  client ??= Comlink.wrap<CvWorkerApi>(
-    new Worker(new URL('./cv.worker.ts', import.meta.url), { type: 'module' }),
-  );
+  if (client === undefined) {
+    rawWorker = new Worker(new URL('./cv.worker.ts', import.meta.url), { type: 'module' });
+    client = Comlink.wrap<CvWorkerApi>(rawWorker);
+  }
   return client;
+}
+
+/**
+ * Owner report, 2026-09-26: a CV call can hang indefinitely on-device (never resolving or rejecting),
+ * which wedges the single persistent worker for every job after it too, since Comlink's calls queue on
+ * one thread. There is no way to interrupt a stuck call from the caller's side, so the only recovery is
+ * to kill the worker outright and let the next `getCvClient()` create a fresh one. Callers pair this with
+ * a timeout on the call they gave up waiting on (`stage-a.ts`).
+ */
+export function terminateCvClient(): void {
+  rawWorker?.terminate();
+  rawWorker = undefined;
+  client = undefined;
 }
